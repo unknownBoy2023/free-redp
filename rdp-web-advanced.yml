@@ -1,0 +1,190 @@
+# =====================================================================
+#  ADVANCED Browser Desktop Sandbox — NO SIGNUP
+# ---------------------------------------------------------------------
+#  Upgrades over rdp-web-nosignup.yml:
+#    - Self-healing supervisor: auto-restarts Xvfb, xfce, x11vnc,
+#      websockify and cloudflared if any one dies mid-session.
+#    - Auto re-provision: scheduled trigger re-spins a fresh desktop
+#      before/after the 6-hour runner cap.
+#    - Auto-delivery of the rotating URL:
+#        * written to a downloadable run artifact, and
+#        * posted as a comment on a tracked GitHub issue (so you can
+#          read the latest URL by opening ONE issue, no logs needed).
+#    - Configurable inputs via the Actions "Run workflow" dialog
+#      (screen resolution, session TTL, whether to post the issue).
+#    - Resource heartbeats (CPU/load/mem) so you can confirm liveness.
+#
+#  OPERATIONAL CONSTRAINTS (ground truth):
+#    - Hosted runner is destroyed at job end (hard cap ~360 min).
+#      The scheduled trigger handles recovery; true 24/7 still needs
+#      the always-on path in docs/24-7-setup.md.
+#    - trycloudflare quick tunnels are ephemeral + rate-limited.
+#    - No persistence between runs.
+# =====================================================================
+
+name: "Advanced Browser Desktop (no signup)"
+
+on:
+  workflow_dispatch:
+    inputs:
+      screen:
+        description: "Screen resolution"
+        required: false
+        default: "1280x800"
+        type: choice
+        options: ["1280x800", "1920x1080", "1024x768"]
+      session_ttl_min:
+        description: "Session lifetime (minutes, 0 = until runner cap)"
+        required: false
+        default: "0"
+        type: string
+      post_issue:
+        description: "Post the URL to a tracked GitHub issue (true/false)"
+        required: false
+        default: "true"
+        type: boolean
+  schedule:
+    # Auto re-provision loop: every ~5h so a fresh desktop comes up
+    # shortly after the previous runner is torn down. Adjust to taste.
+    - cron: "0 */5 * * *"
+
+concurrency:
+  group: advanced-browser-desktop
+  cancel-in-progress: true
+
+jobs:
+  desktop:
+    name: "Advanced browser desktop"
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure inputs
+        id: cfg
+        run: |
+          echo "SCREEN=${{ inputs.screen || '1280x800' }}x24" >> "$GITHUB_ENV"
+          echo "TTL=${{ inputs.session_ttl_min || '0' }}" >> "$GITHUB_ENV"
+          echo "POST_ISSUE=${{ inputs.post_issue || 'true' }}" >> "$GITHUB_ENV"
+
+      - name: Install desktop, Xvfb, x11vnc, noVNC and cloudflared
+        run: |
+          set -euxo pipefail
+          sudo apt-get update -y
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            xfce4 xfce4-goodies dbus-x11 x11-xserver-utils \
+            xserver-xorg-core xserver-xorg xvfb x11vnc \
+            novnc websockify \
+            fonts-noto-core curl jq openssl socat
+
+          cd "$HOME"
+          curl -fsSL -o cloudflared \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x ./cloudflared
+          ./cloudflared --version
+
+      - name: Create user + write creds file
+        id: creds
+        env:
+          RDP_USER: ${{ secrets.RDP_USER }}
+          RDP_PASS: ${{ secrets.RDP_PASS }}
+        run: |
+          set -euo pipefail
+          U="${RDP_USER:-novncuser}"
+          P="${RDP_PASS:-$(openssl rand -hex 8)}"
+          if ! id -u "$U" >/dev/null 2>&1; then
+            sudo useradd -m -s /bin/bash -G sudo "$U"
+          fi
+          echo "$U:$P" | sudo chpasswd
+          printf 'USER=%s\nPASS=%s\n' "$U" "$P" > /tmp/creds.txt
+
+      - name: Launch desktop stack (background, disowned)
+        env:
+          DISPLAY: ":0"
+        run: |
+          set -euxo pipefail
+          export DISPLAY=:0
+          export XDG_RUNTIME_DIR=/tmp/runtime-root
+          mkdir -p "$XDG_RUNTIME_DIR" && chmod 700 "$XDG_RUNTIME_DIR"
+
+          # Virtual display
+          nohup Xvfb :0 -screen 0 "${SCREEN}" -nolisten tcp >/tmp/xvfb.log 2>&1 &
+          disown || true
+          sleep 2
+
+          # Desktop
+          nohup xfce4-session >/tmp/xfce.log 2>&1 &
+          disown || true
+
+          # VNC
+          PASS=$(grep '^PASS=' /tmp/creds.txt | cut -d= -f2)
+          nohup x11vnc -display :0 -passwd "$PASS" -forever -shared -bg -quiet -rfbport 5900 >/tmp/x11vnc.log 2>&1 &
+          disown || true
+
+          # noVNC over web
+          nohup websockify --web=/usr/share/novnc 6080 localhost:5900 >/tmp/novnc.log 2>&1 &
+          disown || true
+
+          sleep 4
+          echo "--- Xvfb ---";  pgrep -af Xvfb || true
+          echo "--- xfce ---";  pgrep -af xfce4-session || true
+          echo "--- x11vnc ---"; pgrep -af x11vnc || true
+          echo "--- novnc ---"; pgrep -af websockify || true
+
+      - name: Start cloudflared tunnel + capture URL to a file
+        run: |
+          set -euxo pipefail
+          cd "$HOME"
+          nohup ./cloudflared tunnel --url http://localhost:6080 --no-autoupdate \
+            >"$HOME/cloudflared.log" 2>&1 &
+          disown || true
+
+          URL=""
+          for i in $(seq 1 40); do
+            URL=$(grep -oE "https://[a-zA-Z0-9-]+\.trycloudflare\.com" "$HOME/cloudflared.log" | tail -1)
+            [ -n "$URL" ] && break
+            sleep 3
+          done
+          if [ -z "$URL" ]; then
+            echo "::error::cloudflared produced no URL yet. Log tail:"; tail -25 "$HOME/cloudflared.log"; exit 1
+          fi
+          printf '%s\n' "$URL" > /tmp/session-url.txt
+          echo "WEB_URL=$URL" >> "$GITHUB_ENV"
+          echo "WEB_URL=$URL"
+
+      - name: Upload connection info as a download artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: session-connection
+          path: |
+            /tmp/session-url.txt
+            /tmp/creds.txt
+          if-no-files-found: warn
+
+      - name: Post the URL to a tracked GitHub issue (GitHub-only delivery)
+        if: env.POST_ISSUE == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WEB_URL: ${{ env.WEB_URL }}
+        run: |
+          set -uo pipefail
+          # Find/create a single issue holding the latest session info.
+          ISSUE=$(gh issue list --search "rdp-session" --state open --json number --jq '.[0].number' 2>/dev/null || true)
+          if [ -z "$ISSUE" ]; then
+            ISSUE=$(gh issue create --title "RDP session — latest link" --body "Auto-managed session tracker." 2>/dev/null | sed 's#.*/issues/##') || ISSUE=""
+          fi
+          if [ -n "$ISSUE" ]; then
+            gh issue comment "$ISSUE" --body "Latest browser desktop URL: ${WEB_URL}/vnc.html
+             - VNC password: see the run artifact 'session-connection'
+             - Time: $(date -u +%FT%TZ)" -R "$GITHUB_REPOSITORY" || true
+            echo "Posted latest URL to issue #$ISSUE"
+          else
+            echo "Could not create/find issue; URL is in the run artifact instead."
+          fi
+
+      - name: Run self-healing supervisor (keeps session + job alive)
+        env:
+          POST_ISSUE: ${{ env.POST_ISSUE }}
+        run: bash scripts/session-supervisor.sh /tmp/session-url.txt
